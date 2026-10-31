@@ -15,7 +15,7 @@ if hasattr(time, "tzset"):
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dateparser.search import search_dates
 from dotenv import load_dotenv
 
@@ -105,6 +105,28 @@ def get_due_tasks(now_ts):
 def mark_sent(task_id):
     """Помечает задачу как отправленную, чтобы она не пришла второй раз."""
     run_db("UPDATE tasks SET sent = 1 WHERE id = ?", (task_id,))
+
+
+def get_task_text(chat_id, task_id):
+    """Достаёт текст задачи по номеру. Если такой задачи нет, вернёт None."""
+    rows = run_db(
+        "SELECT text FROM tasks WHERE id = ? AND chat_id = ?",
+        (task_id, chat_id),
+        fetch=True,
+    )
+    return rows[0][0] if rows else None
+
+
+def snooze_task(chat_id, task_id, minutes):
+    """
+    Откладывает задачу: ставит новое время (сейчас + N минут) и снова
+    помечает как неотправленную. Тогда цикл напоминаний пришлёт её ещё раз.
+    """
+    new_time = int((datetime.now(TZ) + timedelta(minutes=minutes)).timestamp())
+    return run_db(
+        "UPDATE tasks SET remind_at = ?, sent = 0 WHERE id = ? AND chat_id = ?",
+        (new_time, task_id, chat_id),
+    )
 
 
 # ======================= РАЗБОР ТЕКСТА =======================
@@ -280,6 +302,22 @@ def parse_task(text):
 
 # ======================= НАПОМИНАНИЯ =======================
 
+def reminder_keyboard(task_id):
+    """
+    Кнопки под напоминанием. В callback_data мы прячем «действие:номер задачи»,
+    чтобы бот понял, какая именно кнопка нажата и к какой задаче она относится.
+    """
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Выполнено", callback_data=f"done:{task_id}")],
+            [
+                InlineKeyboardButton(text="⏰ +10 минут", callback_data=f"snooze:{task_id}:10"),
+                InlineKeyboardButton(text="⏰ +1 час", callback_data=f"snooze:{task_id}:60"),
+            ],
+        ]
+    )
+
+
 async def reminder_loop():
     """
     Работает в фоне всё время, пока запущен бот.
@@ -290,7 +328,11 @@ async def reminder_loop():
         try:
             now_ts = int(datetime.now(TZ).timestamp())
             for task_id, chat_id, text in get_due_tasks(now_ts):
-                await bot.send_message(chat_id, f"⏰ Напоминание:\n{text}")
+                await bot.send_message(
+                    chat_id,
+                    f"⏰ Напоминание:\n{text}",
+                    reply_markup=reminder_keyboard(task_id),
+                )
                 mark_sent(task_id)
         except Exception as error:
             # Если что-то пошло не так (например, нет интернета), бот не падает,
@@ -352,6 +394,37 @@ async def delete_by_command(message: Message, command: CommandObject):
 async def delete_by_text(message: Message):
     number = re.search(r"(\d+)\s*$", message.text).group(1)
     await do_delete(message, number)
+
+
+# Нажата кнопка «Выполнено»
+@dp.callback_query(F.data.startswith("done:"))
+async def on_done(callback: CallbackQuery):
+    task_id = int(callback.data.split(":")[1])
+    text = get_task_text(callback.message.chat.id, task_id)
+    if text is None:
+        await callback.answer("Эта задача уже удалена", show_alert=True)
+        return
+    # Меняем текст сообщения и убираем кнопки, чтобы нельзя было нажать повторно
+    await callback.message.edit_text(f"✅ Выполнено:\n{text}")
+    await callback.answer()
+
+
+# Нажата кнопка «+10 минут» или «+1 час»
+@dp.callback_query(F.data.startswith("snooze:"))
+async def on_snooze(callback: CallbackQuery):
+    _, task_id, minutes = callback.data.split(":")
+    task_id, minutes = int(task_id), int(minutes)
+    text = get_task_text(callback.message.chat.id, task_id)
+    if text is None:
+        await callback.answer("Эта задача уже удалена", show_alert=True)
+        return
+    snooze_task(callback.message.chat.id, task_id, minutes)
+    new_time = datetime.now(TZ) + timedelta(minutes=minutes)
+    label = "10 минут" if minutes == 10 else "1 час"
+    await callback.message.edit_text(
+        f"⏰ Отложено на {label} (до {new_time.strftime('%H:%M')}):\n{text}"
+    )
+    await callback.answer()
 
 
 # Любой другой текст — считаем, что это новая задача
