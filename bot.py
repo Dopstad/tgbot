@@ -2,8 +2,16 @@ import asyncio
 import os
 import re
 import sqlite3
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+# Говорим программе, что живём по времени Екатеринбурга, даже если сервер
+# стоит в другой стране. Без этого слова вроде «завтра» могут считаться
+# от времени сервера, а не твоего.
+os.environ["TZ"] = "Asia/Yekaterinburg"
+if hasattr(time, "tzset"):
+    time.tzset()
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -100,37 +108,172 @@ def mark_sent(task_id):
 
 
 # ======================= РАЗБОР ТЕКСТА =======================
+# Шаблоны (регулярные выражения) — это «лупа», которой бот ищет в тексте
+# нужные слова. Флаг re.IGNORECASE значит «регистр не важен».
 
-def parse_task(text):
+FLAGS = re.IGNORECASE
+
+# Дни недели во всех формах: «в пятницу», «пятница», «в воскресенье»
+WEEKDAY_WORDS = r"(понедельник|вторник|сред[ау]|четверг|пятниц[ау]|суббот[ау]|воскресенье)"
+WEEKDAY_STEMS = [
+    ("понедельник", 0), ("вторник", 1), ("сред", 2), ("четверг", 3),
+    ("пятниц", 4), ("суббот", 5), ("воскресень", 6),
+]
+
+# «завтра», «послезавтра», «сегодня»
+RE_DAYWORD = re.compile(r"\b(послезавтра|завтра|сегодня)\b", FLAGS)
+
+# «в пятницу», «в следующую пятницу», «пятница»
+RE_WEEKDAY = re.compile(
+    r"(?:\b(?:в|во)\s+)?"
+    r"(?:(?P<mod>следующ\w+|эт\w+|ближайш\w+)\s+)?"
+    r"\b(?P<wd>" + WEEKDAY_WORDS[1:-1] + r")\b",
+    FLAGS,
+)
+
+# «на следующей неделе» / «на этой неделе»
+RE_NEXT_WEEK = re.compile(r"\bна\s+следующ\w*\s+недел\w*", FLAGS)
+RE_THIS_WEEK = re.compile(r"\bна\s+эт\w*\s+недел\w*", FLAGS)
+
+# Время: «в 15:00», «в 7 вечера», «в 9 утра», «в 15 часов»
+RE_TIME_COLON = re.compile(r"(?:\b(?:в|к)\s*)?\b(\d{1,2}):(\d{2})\b", FLAGS)
+RE_TIME_PART = re.compile(r"\b(?:в|к)\s+(\d{1,2})\s*(утра|дня|вечера|ночи)\b", FLAGS)
+RE_TIME_HOURS = re.compile(r"\b(?:в|к)\s+(\d{1,2})\s*(?:часов|часа|час|ч)\b", FLAGS)
+
+
+def now_local():
+    """Текущее время в Екатеринбурге."""
+    return datetime.now(TZ)
+
+
+def weekday_index(word):
+    """Превращает слово «пятницу» в номер дня недели (пн=0 ... вс=6)."""
+    word = word.lower()
+    for stem, index in WEEKDAY_STEMS:
+        if word.startswith(stem):
+            return index
+    return None
+
+
+def cut(text, match):
+    """Вырезает найденный кусок из текста."""
+    return text[: match.start()] + " " + text[match.end():]
+
+
+def clean_task(text):
+    """Оставляет чистую суть задачи: убирает «напомни мне» и лишние знаки."""
+    text = re.sub(r"^\s*(напомни|напиши)\s+(мне\s+)?", "", text, flags=FLAGS)
+    text = re.sub(r"\s+", " ", text).strip(" ,.-—:")
+    # Если в конце остался повисший предлог («Позвонить Ивану в»), убираем его
+    text = re.sub(r"\s+(в|во|на|к)$", "", text, flags=FLAGS)
+    return text.strip(" ,.-—:")
+
+
+def parse_with_dateparser(text):
     """
-    Разбирает фразу на суть задачи и время напоминания.
-    Возвращает:
-      None            - если дату в тексте найти не удалось
-      (задача, None)  - если дата есть, а времени нет
-      (задача, время) - если всё нашлось
+    Запасной вариант: библиотека dateparser. Она умеет «через 2 часа»,
+    «15.11 в 10:00» и подобное. Работает, если свои правила ничего не нашли.
     """
     settings = {
         "TIMEZONE": "Asia/Yekaterinburg",
         "RETURN_AS_TIMEZONE_AWARE": True,
         "PREFER_DATES_FROM": "future",
     }
-
     found = search_dates(text, languages=["ru"], settings=settings)
     if not found:
         return None
 
     fragment, when = max(found, key=lambda item: len(item[0]))
-
-    task = text.replace(fragment, "")
-    task = re.sub(r"^\s*(напомни|напиши)\s+(мне\s+)?", "", task, flags=re.IGNORECASE)
-    task = re.sub(r"\s+", " ", task).strip(" ,.-—:")
+    task = clean_task(text.replace(fragment, ""))
 
     has_clock = re.search(r"\d{1,2}[:.]\d{2}", fragment)
-    has_relative = re.search(r"через", fragment, flags=re.IGNORECASE)
-    has_hours = re.search(r"\bв\s+\d{1,2}\s*(час|ч\b)", fragment, flags=re.IGNORECASE)
+    has_relative = re.search(r"через", fragment, flags=FLAGS)
+    has_hours = re.search(r"\bв\s+\d{1,2}\s*(час|ч\b)", fragment, flags=FLAGS)
 
     if not (has_clock or has_relative or has_hours):
         return task, None
+    return task, when
+
+
+def parse_task(text):
+    """
+    Разбирает фразу на суть задачи и время напоминания.
+    Возвращает:
+      None            - если дату в тексте найти не удалось
+      (задача, None)  - если день есть, а времени нет
+      (задача, время) - если всё нашлось
+    """
+    now = now_local()
+    work = text
+
+    # ---- 1. Ищем время ----
+    hour = minute = None
+    m = RE_TIME_COLON.search(work)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2))
+    else:
+        m = RE_TIME_PART.search(work)
+        if m:
+            h, part = int(m.group(1)), m.group(2).lower()
+            minute = 0
+            if part in ("утра", "ночи"):
+                hour = 0 if h == 12 else h
+            elif part == "дня":
+                hour = h if h >= 12 else h + 12
+            else:  # вечера
+                hour = h + 12 if h < 12 else h
+        else:
+            m = RE_TIME_HOURS.search(work)
+            if m:
+                hour, minute = int(m.group(1)), 0
+    if m:
+        work = cut(work, m)
+    if hour is not None and not (0 <= hour <= 23 and 0 <= minute <= 59):
+        hour = minute = None
+
+    # ---- 2. Ищем день ----
+    next_week = bool(RE_NEXT_WEEK.search(work))
+    this_week = bool(RE_THIS_WEEK.search(work))
+    work = RE_NEXT_WEEK.sub(" ", work)
+    work = RE_THIS_WEEK.sub(" ", work)
+
+    day = None
+    auto_weekday = False  # True, если день недели назван без «следующей/этой»
+
+    m = RE_DAYWORD.search(work)
+    if m:
+        offset = {"сегодня": 0, "завтра": 1, "послезавтра": 2}[m.group(1).lower()]
+        day = now.date() + timedelta(days=offset)
+        work = cut(work, m)
+    else:
+        m = RE_WEEKDAY.search(work)
+        if m:
+            index = weekday_index(m.group("wd"))
+            mod = (m.group("mod") or "").lower()
+            today = now.date()
+            monday = today - timedelta(days=today.weekday())  # понедельник этой недели
+            if next_week or mod.startswith("следующ"):
+                day = monday + timedelta(days=7 + index)
+            elif this_week or mod.startswith("эт"):
+                day = monday + timedelta(days=index)
+            else:
+                day = today + timedelta(days=(index - today.weekday()) % 7)
+                auto_weekday = True
+            work = cut(work, m)
+
+    # Своими правилами день не нашёлся — пробуем запасной вариант
+    if day is None:
+        return parse_with_dateparser(text)
+
+    task = clean_task(work)
+    if hour is None:
+        return task, None
+
+    when = datetime(day.year, day.month, day.day, hour, minute, tzinfo=TZ)
+
+    # «В пятницу» в саму пятницу, когда время уже прошло, значит следующая пятница
+    if auto_weekday and when <= now:
+        when += timedelta(days=7)
 
     return task, when
 
@@ -163,7 +306,9 @@ async def start(message: Message):
     await message.answer(
         "Привет! Я бот-напоминалка.\n\n"
         "Чтобы поставить задачу, напиши, например:\n"
-        "Позвонить Ивану завтра в 15:00\n\n"
+        "Позвонить Ивану завтра в 15:00\n"
+        "Тренировка в пятницу в 19:00\n"
+        "Планёрка в понедельник на следующей неделе в 9:00\n\n"
         "Команды:\n"
         "/list — все мои задачи\n"
         "/del 3 — удалить задачу №3 (или напиши «удали 3»)"
@@ -227,7 +372,7 @@ async def handle_task(message: Message):
         await message.answer("Укажи время в формате 15:00, например: завтра в 15:00")
         return
 
-    if when < datetime.now(TZ):
+    if when < now_local():
         await message.answer("Это время уже прошло. Укажи время в будущем.")
         return
 
