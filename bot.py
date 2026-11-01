@@ -1,9 +1,10 @@
 import asyncio
+import calendar
 import os
 import re
 import sqlite3
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # Говорим программе, что живём по времени Екатеринбурга, даже если сервер
@@ -16,6 +17,8 @@ if hasattr(time, "tzset"):
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -289,6 +292,9 @@ def rule_days(rule):
 
 def describe_repeat(rule):
     """Правило повтора словами."""
+    if rule.startswith("month:"):
+        day = int(rule[6:])
+        return "каждый месяц в последний день" if day >= 31 else f"каждый месяц, {day} числа"
     days = rule_days(rule)
     if rule == "daily" or days == set(range(7)):
         return "каждый день"
@@ -301,6 +307,19 @@ def describe_repeat(rule):
 
 def next_occurrence(rule, hour, minute, after):
     """Ближайшее время по правилу повтора, которое строго позже момента after."""
+    if rule.startswith("month:"):
+        # Ежемесячно: если числа в месяце нет (30 февраля), берём последний день месяца
+        wanted = int(rule[6:])
+        year, month = after.year, after.month
+        for _ in range(14):
+            last_day = calendar.monthrange(year, month)[1]
+            candidate = datetime(year, month, min(wanted, last_day), hour, minute, tzinfo=TZ)
+            if candidate > after:
+                return candidate
+            month += 1
+            if month == 13:
+                year, month = year + 1, 1
+        return None
     days = rule_days(rule)
     for add in range(0, 9):
         d = after.date() + timedelta(days=add)
@@ -378,6 +397,15 @@ RE_WEEKENDS = re.compile(r"\b(?:по\s+выходным|кажд\w+\s+выход
 RE_REPEAT_DAYS = re.compile(
     r"\b(?:кажд\w+|по)\s+(" + WD_ANY + r"(?:\s*(?:,\s*и|,|и)\s*" + WD_ANY + r")*)\b",
     FLAGS,
+)
+
+# Ежемесячно: «каждое 15 число», «каждый месяц 15 числа», «15 числа каждого месяца»
+RE_MONTHLY_A = re.compile(
+    r"\b(?:кажд\w+(?:\s+месяц\w*)?|ежемесячно)\s+(?:в\s+)?(\d{1,2})(?:-?го|-?е)?\s+(?:числа|число)\b",
+    FLAGS,
+)
+RE_MONTHLY_B = re.compile(
+    r"\b(\d{1,2})(?:-?го|-?е)?\s+(?:числа|число)\s+кажд\w+\s+месяц\w*", FLAGS
 )
 
 # «Заранее»: «за 30 минут», «за 1 час», «за 2 дня», «за неделю», «за полчаса»
@@ -460,6 +488,35 @@ def parse_with_dateparser(text):
     return task, when
 
 
+def find_repeat(text):
+    """
+    Ищет в тексте повтор. Возвращает (правило, найденный кусок) или ("", None).
+    Правила: "daily", "wd:0,2,4" (дни недели), "month:15" (число месяца).
+    """
+    m = RE_MONTHLY_A.search(text) or RE_MONTHLY_B.search(text)
+    if m and 1 <= int(m.group(1)) <= 31:
+        return f"month:{int(m.group(1))}", m
+
+    m = RE_EVERY_DAY.search(text)
+    if m:
+        return "daily", m
+
+    m = RE_WORKDAYS.search(text)
+    if m:
+        return "wd:0,1,2,3,4", m
+
+    m = RE_WEEKENDS.search(text)
+    if m:
+        return "wd:5,6", m
+
+    m = RE_REPEAT_DAYS.search(text)
+    if m:
+        days = sorted({weekday_index(w) for w in re.findall(WD_ANY, m.group(1), FLAGS)})
+        return "wd:" + ",".join(str(d) for d in days), m
+
+    return "", None
+
+
 def parse_task(text):
     """
     Разбирает фразу: суть задачи, время, повтор и предупреждения «заранее».
@@ -469,24 +526,8 @@ def parse_task(text):
     now = now_local()
     base = text
 
-    # ---- 1. Повтор: «каждый день», «по понедельникам» ----
-    repeat = ""
-    m = RE_EVERY_DAY.search(base)
-    if m:
-        repeat = "daily"
-    else:
-        m = RE_WORKDAYS.search(base)
-        if m:
-            repeat = "wd:0,1,2,3,4"
-        else:
-            m = RE_WEEKENDS.search(base)
-            if m:
-                repeat = "wd:5,6"
-            else:
-                m = RE_REPEAT_DAYS.search(base)
-                if m:
-                    days = sorted({weekday_index(w) for w in re.findall(WD_ANY, m.group(1), FLAGS)})
-                    repeat = "wd:" + ",".join(str(d) for d in days)
+    # ---- 1. Повтор: «каждый день», «по понедельникам», «каждое 15 число» ----
+    repeat, m = find_repeat(base)
     if repeat:
         base = cut(base, m)
 
@@ -603,63 +644,78 @@ def parse_task(text):
 
 # ======================= МЕНЮ И ТЕКСТЫ =======================
 
+BTN_MENU = "📱 Меню"  # кнопка внизу экрана, открывает главное меню
+# Старые кнопки нижней панели. Оставляем, чтобы они не ломались, если ещё висят в чате.
 BTN_LIST = "📋 Мои задачи"
 BTN_TODAY = "📅 На сегодня"
 BTN_HELP = "ℹ️ Как пользоваться"
 
 HELP_TEXT = (
-    "Я бот-напоминалка. Просто напиши, что и когда напомнить:\n\n"
+    "Я бот-напоминалка. Меню открывается кнопкой «📱 Меню» внизу или командой /menu.\n\n"
+    "Задачи можно ставить и обычными фразами:\n"
     "• Позвонить Ивану завтра в 15:00\n"
     "• Тренировка в пятницу в 19:00\n"
     "• Планёрка в понедельник на следующей неделе в 9:00\n"
     "• Купить воду через 2 часа\n\n"
     "Заранее (можно несколько сразу):\n"
     "• Созвон завтра в 15:00, напомни за 30 минут\n"
-    "• Конференция в пятницу в 10:00 за 1 час и за 2 дня\n"
-    "Можно за минуты, часы, дни и недели.\n\n"
+    "• Конференция в пятницу в 10:00 за 1 час и за 2 дня\n\n"
     "Повторы:\n"
     "• Зарядка каждый день в 7:00\n"
     "• Планёрка каждый понедельник в 9:00\n"
     "• Тренировка по понедельникам, средам и пятницам в 19:00\n"
-    "• Отчёт по будням в 17:30\n\n"
+    "• Отчёт по будням в 17:30\n"
+    "• Оплатить аренду каждое 15 число в 10:00\n\n"
     "Команды:\n"
-    "/list — все задачи (с кнопками удаления)\n"
+    "/menu — главное меню\n"
+    "/list — все задачи\n"
     "/today — задачи на сегодня\n"
     "/del 3 — удалить задачу №3 (или напиши «удали 3»)\n"
     "/digest — утренняя сводка: /digest 7:30, /digest off"
 )
 
+# Последний «экран» меню в каждом чате (номер сообщения).
+# Когда показываем новый экран, старый удаляем, чтобы чат не захламлялся.
+LAST_SCREEN = {}
 
-def main_menu():
-    """Кнопки внизу экрана."""
+
+def btn(text, data):
+    """Одна кнопка под сообщением."""
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def grid(buttons, per_row):
+    """Раскладывает кнопки по рядам."""
+    return [buttons[i:i + per_row] for i in range(0, len(buttons), per_row)]
+
+
+def markup(rows):
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+BACK_ROW = [btn("⬅️ Назад в меню", "m:main")]
+
+
+def reply_menu():
+    """Одна кнопка внизу экрана: открывает меню."""
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_LIST), KeyboardButton(text=BTN_TODAY)],
-            [KeyboardButton(text=BTN_HELP)],
-        ],
+        keyboard=[[KeyboardButton(text=BTN_MENU)]],
         resize_keyboard=True,
+        is_persistent=True,
     )
 
 
-def render_list(chat_id):
-    """Текст списка задач и кнопки удаления под ним."""
-    tasks = get_tasks(chat_id)
-    if not tasks:
-        return "Активных задач нет.", None
-
-    shown = tasks[:25]
-    lines = ["Твои задачи:\n"]
-    lines += [task_line(*task) for task in shown]
-    if len(tasks) > len(shown):
-        lines.append(f"\n...и ещё {len(tasks) - len(shown)}")
-    lines.append("\nУдалить: нажми кнопку с номером или напиши /del номер")
-
-    buttons = [
-        InlineKeyboardButton(text=f"🗑 №{task[0]}", callback_data=f"del:{task[0]}")
-        for task in shown
+def main_menu_screen():
+    """Главное меню."""
+    text = "📱 Главное меню\n\nВыбери действие:"
+    rows = [
+        [btn("📋 Список задач", "m:list")],
+        [btn("➕ Новая задача", "m:new")],
+        [btn("🌅 Ежедневный дайджест", "m:digest")],
+        [btn("🔁 Добавить ежедневную задачу", "m:daily")],
+        [btn("📆 Добавить ежемесячную задачу", "m:monthly")],
     ]
-    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+    return text, markup(rows)
 
 
 def render_today(chat_id, now):
@@ -672,6 +728,188 @@ def render_today(chat_id, now):
         when = datetime.fromtimestamp(remind_at, TZ)
         mark = " 🔁" if repeat_rule else ""
         lines.append(f"{when.strftime('%H:%M')} — {text}{mark}")
+    return "\n".join(lines)
+
+
+def list_screen(chat_id):
+    """Экран «Список задач»: список и кнопки удаления."""
+    tasks = get_tasks(chat_id)
+    if not tasks:
+        return "📋 Список задач\n\nАктивных задач нет.", markup([BACK_ROW])
+
+    shown = tasks[:25]
+    lines = ["📋 Список задач\n"]
+    lines += [task_line(*task) for task in shown]
+    if len(tasks) > len(shown):
+        lines.append(f"\n...и ещё {len(tasks) - len(shown)}")
+    lines.append("\nУдалить: нажми кнопку с номером или напиши /del номер")
+
+    buttons = [btn(f"🗑 №{task[0]}", f"del:{task[0]}") for task in shown]
+    return "\n".join(lines), markup(grid(buttons, 4) + [BACK_ROW])
+
+
+def digest_screen(chat_id, note=""):
+    """Экран «Ежедневный дайджест»."""
+    ensure_user(chat_id)
+    on, hhmm = run_db(
+        "SELECT digest_on, digest_time FROM users WHERE chat_id = ?", (chat_id,), fetch=True
+    )[0]
+    state = f"включён, каждое утро в {hhmm}" if on else "выключен"
+    text = (
+        "🌅 Ежедневный дайджест\n\n"
+        "Каждое утро бот присылает список задач на сегодня (если они есть).\n\n"
+        f"Сейчас: {state}"
+    )
+    if note:
+        text += f"\n\n{note}"
+    rows = [
+        [btn("🔕 Выключить" if on else "🔔 Включить", "dg:toggle")],
+        [btn("🕐 Изменить время", "dg:time")],
+        BACK_ROW,
+    ]
+    return text, markup(rows)
+
+
+# ---------- Пошаговые мастера: новая, ежедневная, ежемесячная задача ----------
+
+class Wizard(StatesGroup):
+    text = State()         # ждём текст задачи
+    custom_date = State()  # ждём дату, написанную руками
+    custom_time = State()  # ждём время, написанное руками
+    choosing = State()     # выбор кнопками
+
+
+# Шаги для каждого вида задач
+STEPS = {
+    "once": ["text", "day", "hour", "minute", "advance"],
+    "daily": ["text", "hour", "minute", "advance"],
+    "monthly": ["text", "mday", "hour", "minute", "advance"],
+}
+TITLES = {
+    "once": "➕ Новая задача",
+    "daily": "🔁 Ежедневная задача",
+    "monthly": "📆 Ежемесячная задача",
+}
+ADVANCE_CHOICES = [10, 30, 60, 120, 1440, 2880, 10080]
+ADVANCE_LABELS = {
+    10: "10 минут", 30: "30 минут", 60: "1 час", 120: "2 часа",
+    1440: "1 день", 2880: "2 дня", 10080: "1 неделя",
+}
+
+
+def day_label(d):
+    """«Вт 03.11.2026»."""
+    return f"{WD_SHORT[d.weekday()].capitalize()} {d.strftime('%d.%m.%Y')}"
+
+
+def wizard_summary(data):
+    """Что уже выбрано: показываем над кнопками."""
+    lines = []
+    if data.get("text"):
+        lines.append(f"Задача: {data['text']}")
+    if data["mode"] == "daily":
+        lines.append("Повтор: каждый день")
+    if data["mode"] == "monthly" and data.get("mday"):
+        lines.append("Число: последний день месяца" if data["mday"] >= 31 else f"Число: {data['mday']}")
+    if data.get("day"):
+        lines.append(f"День: {day_label(date.fromisoformat(data['day']))}")
+    if data.get("hour") is not None:
+        minute = f"{data['minute']:02d}" if data.get("minute") is not None else "__"
+        lines.append(f"Время: {data['hour']:02d}:{minute}")
+    return "\n".join(lines)
+
+
+def wizard_screen(data, note=""):
+    """Экран текущего шага мастера: (текст, кнопки)."""
+    mode, i = data["mode"], data["i"]
+    step = STEPS[mode][i]
+    custom = data.get("custom")
+    now = now_local()
+    today = now.date()
+
+    lines = [TITLES[mode], ""]
+    summary = wizard_summary(data)
+    if summary:
+        lines += [summary, ""]
+    if note:
+        lines += [note, ""]
+
+    rows = []
+
+    if custom == "date":
+        lines.append("✍️ Напиши дату: ДД.ММ или ДД.ММ.ГГГГ\nНапример: 15.11")
+    elif custom == "time":
+        lines.append("✍️ Напиши время: ЧЧ:ММ\nНапример: 15:40")
+    elif step == "text":
+        lines.append(
+            "✍️ Напиши, что напомнить. Только суть, без даты: "
+            "дату и время выберешь кнопками.\nНапример: Позвонить Ивану"
+        )
+    elif step == "day":
+        lines.append("📅 На какой день?")
+        quick = [("Сегодня", 0), ("Завтра", 1), ("Послезавтра", 2)]
+        rows.append([btn(name, f"w:day:{(today + timedelta(days=n)).isoformat()}") for name, n in quick])
+        later = []
+        for n in range(3, 10):
+            d = today + timedelta(days=n)
+            later.append(btn(f"{WD_SHORT[d.weekday()].capitalize()} {d.strftime('%d.%m')}", f"w:day:{d.isoformat()}"))
+        rows += grid(later, 4)
+        rows.append([btn("✍️ Другая дата", "w:daycustom")])
+    elif step == "hour":
+        lines.append("🕐 Во сколько? Выбери час.")
+        hours = range(24)
+        if mode == "once" and data.get("day") == today.isoformat():
+            hours = range(now.hour, 24)
+        rows += grid([btn(f"{h:02d}", f"w:h:{h}") for h in hours], 6)
+        rows.append([btn("✍️ Ввести время вручную", "w:timecustom")])
+    elif step == "minute":
+        lines.append("🕐 Выбери минуты.")
+        hour = data["hour"]
+        rows += grid([btn(f"{hour:02d}:{m:02d}", f"w:min:{m}") for m in range(0, 60, 5)], 4)
+        rows.append([btn("✍️ Ввести время вручную", "w:timecustom")])
+    elif step == "mday":
+        lines.append(
+            "📆 Какого числа каждый месяц?\n"
+            "Если в месяце такого числа нет (например, 30 февраля), "
+            "напоминание придёт в последний день месяца."
+        )
+        rows += grid([btn(str(n), f"w:md:{n}") for n in range(1, 32)], 7)
+        rows.append([btn("🔚 Последний день месяца", "w:md:31")])
+    elif step == "advance":
+        lines.append(
+            "🔔 Предупредить заранее? Отметь нужное (можно несколько) и нажми «Сохранить». "
+            "Если предупреждения не нужны, просто нажми «Сохранить»."
+        )
+        chosen = set(data.get("advance", []))
+        buttons = [
+            btn(("✅ " if m in chosen else "") + ADVANCE_LABELS[m], f"w:adv:{m}")
+            for m in ADVANCE_CHOICES
+        ]
+        rows += grid(buttons, 3)
+        rows.append([btn("💾 Сохранить", "w:save")])
+
+    # Кнопки возврата
+    if custom:
+        rows.append([btn("↩️ Выбрать кнопками", "w:cur")])
+    elif i > 0:
+        rows.append([btn("↩️ Предыдущий шаг", "w:prev")])
+    rows.append(BACK_ROW)
+
+    return "\n".join(lines).strip(), markup(rows)
+
+
+def confirmation_text(task, when, repeat, made, skipped):
+    """Ответ «Записал ✅» со всеми подробностями."""
+    lines = ["Записал ✅", f"Задача: {task}"]
+    if repeat:
+        lines.append(f"Повтор: {describe_repeat(repeat)}")
+        lines.append(f"Первое напоминание: {when.strftime('%d.%m.%Y в %H:%M')} (Екатеринбург)")
+    else:
+        lines.append(f"Напомню: {when.strftime('%d.%m.%Y в %H:%M')} (Екатеринбург)")
+    if made:
+        lines.append("🔔 Заранее: " + ", ".join(fmt_before(m) for m in made))
+    if skipped:
+        lines.append("Не поставил (время уже прошло): " + ", ".join(fmt_before(m) for m in skipped))
     return "\n".join(lines)
 
 
@@ -800,32 +1038,149 @@ async def reminder_loop():
         await asyncio.sleep(20)
 
 
+# ======================= ЭКРАНЫ: ПОКАЗ И УДАЛЕНИЕ СТАРЫХ =======================
+
+async def delete_quietly(chat_id, message_id):
+    """Удаляет сообщение. Если не вышло (например, оно старше 48 часов), молча идёт дальше."""
+    try:
+        await bot.delete_message(chat_id, message_id)
+        return True
+    except Exception:
+        return False
+
+
+async def show_screen(chat_id, text, keyboard, old_message=None):
+    """
+    Показывает новый экран и удаляет старый: то сообщение, с кнопки которого
+    пришло нажатие, и последний экран меню в этом чате.
+    """
+    old_ids = []
+    if old_message is not None:
+        old_ids.append(old_message.message_id)
+    last = LAST_SCREEN.get(chat_id)
+    if last and last not in old_ids:
+        old_ids.append(last)
+
+    sent = await bot.send_message(chat_id, text, reply_markup=keyboard)
+    LAST_SCREEN[chat_id] = sent.message_id
+
+    for message_id in old_ids:
+        if not await delete_quietly(chat_id, message_id):
+            # Удалить не вышло: хотя бы убираем кнопки, чтобы они не вводили в заблуждение
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id, message_id=message_id, reply_markup=None
+                )
+            except Exception:
+                pass
+
+
+async def open_main_menu(chat_id, old_message=None):
+    text, keyboard = main_menu_screen()
+    await show_screen(chat_id, text, keyboard, old_message)
+
+
+async def show_wizard(chat_id, state, old_message=None, note=""):
+    """Показывает текущий шаг мастера и выставляет нужное состояние."""
+    data = await state.get_data()
+    text, keyboard = wizard_screen(data, note)
+    custom = data.get("custom")
+    step = STEPS[data["mode"]][data["i"]]
+    if custom == "date":
+        await state.set_state(Wizard.custom_date)
+    elif custom == "time":
+        await state.set_state(Wizard.custom_time)
+    elif step == "text":
+        await state.set_state(Wizard.text)
+    else:
+        await state.set_state(Wizard.choosing)
+    await show_screen(chat_id, text, keyboard, old_message)
+
+
+async def start_wizard(chat_id, state, mode, old_message=None):
+    await state.clear()
+    await state.update_data(mode=mode, i=0, advance=[], custom=None)
+    await show_wizard(chat_id, state, old_message)
+
+
+def wizard_when(data, now):
+    """Собирает дату и время задачи из выбранного. Возвращает (время, правило повтора)."""
+    mode = data["mode"]
+    hour, minute = data["hour"], data["minute"]
+    if mode == "once":
+        d = date.fromisoformat(data["day"])
+        return datetime(d.year, d.month, d.day, hour, minute, tzinfo=TZ), ""
+    if mode == "daily":
+        return next_occurrence("daily", hour, minute, now), "daily"
+    rule = f"month:{data['mday']}"
+    return next_occurrence(rule, hour, minute, now), rule
+
+
+async def finish_wizard(callback, state, data):
+    """Сохраняет задачу из мастера."""
+    chat_id = callback.message.chat.id
+    now = now_local()
+    when, repeat = wizard_when(data, now)
+    if when <= now:
+        await callback.answer("Это время уже прошло. Выбери другое.", show_alert=True)
+        return
+    _, made, skipped = add_task(chat_id, data["text"], when, repeat, data.get("advance", []))
+    await state.clear()
+    keyboard = markup([[btn("➕ Ещё задачу", "m:new"), btn("📱 Меню", "m:main")]])
+    await show_screen(
+        chat_id,
+        confirmation_text(data["text"], when, repeat, made, skipped),
+        keyboard,
+        callback.message,
+    )
+    await callback.answer("Сохранено ✅")
+
+
 # ======================= КОМАНДЫ БОТА =======================
 
 @dp.message(CommandStart())
-async def start(message: Message):
+async def start(message: Message, state: FSMContext):
+    await state.clear()
     ensure_user(message.chat.id)
-    await message.answer(HELP_TEXT, reply_markup=main_menu())
+    await message.answer(
+        "Привет! Я бот-напоминалка.\n"
+        "Меню открывается кнопкой «📱 Меню» внизу экрана или командой /menu.\n"
+        "Фразами тоже можно, примеры: /help",
+        reply_markup=reply_menu(),
+    )
+    await open_main_menu(message.chat.id)
+
+
+@dp.message(Command("menu"))
+@dp.message(F.text == BTN_MENU)
+async def show_menu(message: Message, state: FSMContext):
+    await state.clear()
+    ensure_user(message.chat.id)
+    await delete_quietly(message.chat.id, message.message_id)  # убираем и сообщение «Меню»
+    await open_main_menu(message.chat.id)
 
 
 @dp.message(Command("help"))
 @dp.message(F.text == BTN_HELP)
-async def show_help(message: Message):
+async def show_help(message: Message, state: FSMContext):
+    await state.clear()
     ensure_user(message.chat.id)
-    await message.answer(HELP_TEXT, reply_markup=main_menu())
+    await message.answer(HELP_TEXT, reply_markup=reply_menu())
 
 
 @dp.message(Command("list"))
 @dp.message(F.text == BTN_LIST)
-async def show_list(message: Message):
+async def show_list(message: Message, state: FSMContext):
+    await state.clear()
     ensure_user(message.chat.id)
-    text, keyboard = render_list(message.chat.id)
-    await message.answer(text, reply_markup=keyboard)
+    text, keyboard = list_screen(message.chat.id)
+    await show_screen(message.chat.id, text, keyboard)
 
 
 @dp.message(Command("today"))
 @dp.message(F.text == BTN_TODAY)
-async def show_today(message: Message):
+async def show_today(message: Message, state: FSMContext):
+    await state.clear()
     ensure_user(message.chat.id)
     body = render_today(message.chat.id, now_local())
     if body is None:
@@ -835,7 +1190,8 @@ async def show_today(message: Message):
 
 
 @dp.message(Command("digest"))
-async def digest_settings(message: Message, command: CommandObject):
+async def digest_settings(message: Message, command: CommandObject, state: FSMContext):
+    await state.clear()
     chat_id = message.chat.id
     ensure_user(chat_id)
     arg = (command.args or "").strip().lower()
@@ -855,16 +1211,8 @@ async def digest_settings(message: Message, command: CommandObject):
         set_digest(chat_id, True, hhmm)
         await message.answer(f"Буду присылать сводку каждое утро в {hhmm}.")
     else:
-        row = run_db(
-            "SELECT digest_on, digest_time FROM users WHERE chat_id = ?", (chat_id,), fetch=True
-        )[0]
-        state = f"включена, в {row[1]}" if row[0] else "выключена"
-        await message.answer(
-            f"Утренняя сводка: {state}.\n"
-            "Поменять время: /digest 7:30\n"
-            "Выключить: /digest off\n"
-            "Включить: /digest on"
-        )
+        text, keyboard = digest_screen(chat_id)
+        await show_screen(chat_id, text, keyboard)
 
 
 async def do_delete(message: Message, raw_number):
@@ -884,6 +1232,82 @@ async def delete_by_command(message: Message, command: CommandObject):
     await do_delete(message, command.args)
 
 
+# ---------- Ввод текста внутри мастеров ----------
+
+@dp.message(Wizard.text, F.text)
+async def wizard_text(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    await delete_quietly(chat_id, message.message_id)  # убираем набранное, чтобы не засорять чат
+    data = await state.get_data()
+    if "mode" not in data:
+        await state.clear()
+        await open_main_menu(chat_id)
+        return
+    text = message.text.strip()
+    if not text:
+        return
+    await state.update_data(text=text[:200], i=data["i"] + 1)
+    await show_wizard(chat_id, state)
+
+
+@dp.message(Wizard.custom_date, F.text)
+async def wizard_custom_date(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    await delete_quietly(chat_id, message.message_id)
+    data = await state.get_data()
+    if "mode" not in data:
+        await state.clear()
+        await open_main_menu(chat_id)
+        return
+
+    m = re.fullmatch(r"\s*(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\s*", message.text)
+    today = now_local().date()
+    note = "⚠️ Не понял дату. Пример: 15.11 или 15.11.2026"
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else today.year
+        if year < 100:
+            year += 2000
+        try:
+            chosen = date(year, month, day)
+            if not m.group(3) and chosen < today:
+                chosen = date(year + 1, month, day)
+            if chosen < today:
+                note = "⚠️ Эта дата уже прошла. Напиши другую."
+            else:
+                await state.update_data(day=chosen.isoformat(), i=data["i"] + 1, custom=None)
+                await show_wizard(chat_id, state)
+                return
+        except ValueError:
+            note = "⚠️ Такой даты не существует. Пример: 15.11"
+    await show_wizard(chat_id, state, note=note)
+
+
+@dp.message(Wizard.custom_time, F.text)
+async def wizard_custom_time(message: Message, state: FSMContext):
+    chat_id = message.chat.id
+    await delete_quietly(chat_id, message.message_id)
+    data = await state.get_data()
+    if "mode" not in data:
+        await state.clear()
+        await open_main_menu(chat_id)
+        return
+
+    m = re.fullmatch(r"\s*(\d{1,2})[:.](\d{2})\s*", message.text)
+    note = "⚠️ Не понял время. Пример: 15:40"
+    if m and int(m.group(1)) <= 23 and int(m.group(2)) <= 59:
+        hour, minute = int(m.group(1)), int(m.group(2))
+        probe = dict(data, hour=hour, minute=minute)
+        if data["mode"] == "once" and wizard_when(probe, now_local())[0] <= now_local():
+            note = "⚠️ Это время уже прошло. Напиши другое."
+        else:
+            advance_index = STEPS[data["mode"]].index("advance")
+            await state.update_data(hour=hour, minute=minute, i=advance_index, custom=None)
+            await show_wizard(chat_id, state)
+            return
+    await show_wizard(chat_id, state, note=note)
+
+
 # Фраза вида «удали 3» / «удалить 3» / «удали задачу 3»
 @dp.message(F.text.regexp(r"(?i)^\s*удал\w*\s+(задач\w*\s+)?(№\s*)?(\d+)\s*$"))
 async def delete_by_text(message: Message):
@@ -893,13 +1317,136 @@ async def delete_by_text(message: Message):
 
 # ---------- Кнопки под сообщениями ----------
 
+# Кнопки главного меню: m:list, m:new, m:digest, m:daily, m:monthly, m:main
+@dp.callback_query(F.data.startswith("m:"))
+async def on_menu_button(callback: CallbackQuery, state: FSMContext):
+    action = callback.data[2:]
+    chat_id = callback.message.chat.id
+    ensure_user(chat_id)
+
+    if action in ("new", "daily", "monthly"):
+        mode = {"new": "once", "daily": "daily", "monthly": "monthly"}[action]
+        await start_wizard(chat_id, state, mode, callback.message)
+    else:
+        await state.clear()
+        if action == "list":
+            text, keyboard = list_screen(chat_id)
+            await show_screen(chat_id, text, keyboard, callback.message)
+        elif action == "digest":
+            text, keyboard = digest_screen(chat_id)
+            await show_screen(chat_id, text, keyboard, callback.message)
+        else:
+            await open_main_menu(chat_id, callback.message)
+    await callback.answer()
+
+
+# Кнопки экрана «Ежедневный дайджест»
+@dp.callback_query(F.data.startswith("dg:"))
+async def on_digest_button(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split(":")
+    action = parts[1]
+    chat_id = callback.message.chat.id
+    ensure_user(chat_id)
+    await state.clear()
+
+    if action == "toggle":
+        on = run_db("SELECT digest_on FROM users WHERE chat_id = ?", (chat_id,), fetch=True)[0][0]
+        set_digest(chat_id, not on)
+        text, keyboard = digest_screen(chat_id)
+        try:
+            # Переключатель меняем «на месте», без нового сообщения
+            await callback.message.edit_text(text, reply_markup=keyboard)
+        except TelegramBadRequest:
+            pass
+    elif action == "time":
+        rows = grid([btn(f"{h:02d}", f"dg:h:{h}") for h in range(24)], 6)
+        rows.append([btn("↩️ К дайджесту", "m:digest")])
+        rows.append(BACK_ROW)
+        await show_screen(
+            chat_id, "🌅 Ежедневный дайджест\n\n🕐 Во сколько присылать? Выбери час.",
+            markup(rows), callback.message,
+        )
+    elif action == "h":
+        hour = int(parts[2])
+        rows = grid([btn(f"{hour:02d}:{m:02d}", f"dg:m:{hour}:{m}") for m in (0, 15, 30, 45)], 4)
+        rows.append([btn("↩️ К дайджесту", "m:digest")])
+        rows.append(BACK_ROW)
+        await show_screen(
+            chat_id, "🌅 Ежедневный дайджест\n\n🕐 Выбери минуты.", markup(rows), callback.message
+        )
+    elif action == "m":
+        hhmm = f"{int(parts[2]):02d}:{int(parts[3]):02d}"
+        set_digest(chat_id, True, hhmm)
+        text, keyboard = digest_screen(chat_id, note=f"✅ Время сохранено: {hhmm}")
+        await show_screen(chat_id, text, keyboard, callback.message)
+    await callback.answer()
+
+
+# Кнопки мастеров: w:day:..., w:h:..., w:min:..., w:md:..., w:adv:..., w:save и т.д.
+@dp.callback_query(F.data.startswith("w:"))
+async def on_wizard_button(callback: CallbackQuery, state: FSMContext):
+    chat_id = callback.message.chat.id
+    data = await state.get_data()
+    if "mode" not in data:
+        # Бот перезапускался, и мастер забыл, на каком шаге вы были
+        await callback.answer("Эта кнопка устарела, открываю меню")
+        await open_main_menu(chat_id, callback.message)
+        return
+
+    parts = callback.data.split(":")
+    action = parts[1]
+    mode, i = data["mode"], data["i"]
+
+    if action == "prev":
+        await state.update_data(i=max(0, i - 1), custom=None)
+    elif action == "cur":
+        await state.update_data(custom=None)
+    elif action == "day":
+        await state.update_data(day=parts[2], i=i + 1)
+    elif action == "daycustom":
+        await state.update_data(custom="date")
+    elif action == "h":
+        await state.update_data(hour=int(parts[2]), i=i + 1)
+    elif action == "md":
+        await state.update_data(mday=int(parts[2]), i=i + 1)
+    elif action == "timecustom":
+        await state.update_data(custom="time")
+    elif action == "min":
+        minute = int(parts[2])
+        probe = dict(data, minute=minute)
+        if mode == "once" and wizard_when(probe, now_local())[0] <= now_local():
+            await callback.answer("Это время уже прошло. Выбери другое.", show_alert=True)
+            return
+        await state.update_data(minute=minute, i=i + 1)
+    elif action == "adv":
+        minutes = int(parts[2])
+        chosen = set(data.get("advance", []))
+        chosen ^= {minutes}  # нажали: добавили, нажали ещё раз: убрали
+        await state.update_data(advance=sorted(chosen, reverse=True))
+        data = await state.get_data()
+        _, keyboard = wizard_screen(data)
+        try:
+            # Галочки меняем «на месте», без нового сообщения
+            await callback.message.edit_reply_markup(reply_markup=keyboard)
+        except TelegramBadRequest:
+            pass
+        await callback.answer()
+        return
+    elif action == "save":
+        await finish_wizard(callback, state, data)
+        return
+
+    await callback.answer()
+    await show_wizard(chat_id, state, callback.message)
+
+
 # Нажата кнопка «🗑 №3» под списком задач
 @dp.callback_query(F.data.startswith("del:"))
 async def on_delete_button(callback: CallbackQuery):
     task_id = int(callback.data.split(":")[1])
     chat_id = callback.message.chat.id
     delete_task(chat_id, task_id)
-    text, keyboard = render_list(chat_id)
+    text, keyboard = list_screen(chat_id)
     try:
         await callback.message.edit_text(text, reply_markup=keyboard)
     except TelegramBadRequest:
@@ -939,7 +1486,7 @@ async def on_snooze(callback: CallbackQuery):
     await callback.answer()
 
 
-# ---------- Новая задача ----------
+# ---------- Новая задача обычной фразой ----------
 
 # Любой другой текст — считаем, что это новая задача
 @dp.message(F.text)
@@ -951,7 +1498,7 @@ async def handle_task(message: Message):
         await message.answer(
             "Не нашёл в сообщении дату. Попробуй так:\n"
             "Позвонить Ивану завтра в 15:00\n\n"
-            "Все примеры: /help"
+            "Или открой меню: /menu. Все примеры: /help"
         )
         return
 
@@ -978,20 +1525,7 @@ async def handle_task(message: Message):
     _, made, skipped = add_task(
         message.chat.id, task, when, result["repeat"], result["advance"]
     )
-
-    lines = ["Записал ✅", f"Задача: {task}"]
-    if result["repeat"]:
-        lines.append(f"Повтор: {describe_repeat(result['repeat'])}")
-        lines.append(f"Первое напоминание: {when.strftime('%d.%m.%Y в %H:%M')} (Екатеринбург)")
-    else:
-        lines.append(f"Напомню: {when.strftime('%d.%m.%Y в %H:%M')} (Екатеринбург)")
-    if made:
-        lines.append("🔔 Заранее: " + ", ".join(fmt_before(m) for m in made))
-    if skipped:
-        lines.append(
-            "Не поставил (время уже прошло): " + ", ".join(fmt_before(m) for m in skipped)
-        )
-    await message.answer("\n".join(lines))
+    await message.answer(confirmation_text(task, when, result["repeat"], made, skipped))
 
 
 # ======================= ЗАПУСК =======================
