@@ -13,6 +13,7 @@
 Таблица advances — запланированные предупреждения «заранее»
 Таблица users    — настройки утренней сводки
 """
+import os
 import sqlite3
 from datetime import datetime, timedelta
 
@@ -36,6 +37,8 @@ def run_db(query, params=(), fetch=False, want_id=False):
 
 def init_db():
     """Создаёт таблицы при первом запуске и дополняет старую базу новыми колонками."""
+    # Папка для базы (например, /app/data на хостинге) должна существовать
+    os.makedirs(os.path.dirname(os.path.abspath(core.DB_PATH)), exist_ok=True)
     run_db(
         """
         CREATE TABLE IF NOT EXISTS tasks (

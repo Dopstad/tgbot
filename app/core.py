@@ -24,8 +24,21 @@ TOKEN = os.getenv("BOT_TOKEN")
 # Твой часовой пояс: Екатеринбург (UTC+5)
 TZ = ZoneInfo("Asia/Yekaterinburg")
 
-# Файл, где хранятся данные (создаётся сам рядом с bot.py)
-DB_PATH = os.getenv("DB_PATH", "tasks.db")
+
+
+def db_path_from_env(environ):
+    """
+    Где лежит файл базы с задачами.
+    На хостинге Bothost постоянное хранилище (переживает пересборку) находится в /app/data,
+    поэтому там в настройках бота задаётся переменная DATA_DIR=/app/data.
+    Без переменной файл лежит рядом с bot.py (так удобно на Маке).
+    """
+    if environ.get("DB_PATH"):
+        return environ["DB_PATH"]
+    return os.path.join(environ.get("DATA_DIR", "."), "tasks.db")
+
+
+DB_PATH = db_path_from_env(os.environ)
 
 # Во сколько присылать утреннюю сводку по умолчанию
 DEFAULT_DIGEST_TIME = "08:00"
