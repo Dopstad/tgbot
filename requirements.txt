@@ -1,4 +1,4 @@
-aiogram
-python-dotenv
-dateparser
-tzdata
+aiogram==3.31.0
+python-dotenv==1.2.4
+dateparser==1.4.3
+tzdata==2026.6
