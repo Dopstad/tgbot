@@ -3,11 +3,14 @@
 Присылает напоминания, предупреждения «заранее» и утреннюю сводку.
 """
 import asyncio
+import logging
 from datetime import datetime
 
 from app import core, db, ui
 from app.core import TZ
 from app.dates import fmt_before, next_occurrence, short_when, WD_SHORT
+
+log = logging.getLogger(__name__)
 
 
 async def process_reminders(now):
@@ -36,8 +39,8 @@ async def process_reminders(now):
                 f"Начало: {when.strftime('%d.%m.%Y в %H:%M')}",
             )
             db.run_db("UPDATE advances SET sent = 1 WHERE id = ?", (adv_id,))
-        except Exception as error:
-            print("Ошибка при отправке предупреждения:", error)
+        except Exception:
+            log.exception("Не удалось отправить предупреждение (задача в чате %s)", chat_id)
 
     # --- 2 и 3. Основные напоминания ---
     due_tasks = db.run_db(
@@ -69,8 +72,8 @@ async def process_reminders(now):
                 db.plan_advances(task_id, next_time, db.parse_advance(advance_min), now)
             else:
                 db.run_db("UPDATE tasks SET sent = 1 WHERE id = ?", (task_id,))
-        except Exception as error:
-            print("Ошибка при отправке напоминания:", error)
+        except Exception:
+            log.exception("Не удалось отправить напоминание №%s", task_id)
 
 
 async def send_digests(now):
@@ -96,8 +99,8 @@ async def send_digests(now):
                 f"🌅 Доброе утро! Задачи на сегодня "
                 f"({WD_SHORT[now.weekday()]} {now.strftime('%d.%m')}):\n\n{body}",
             )
-        except Exception as error:
-            print("Ошибка при отправке сводки:", error)
+        except Exception:
+            log.exception("Не удалось отправить сводку (чат %s)", chat_id)
 
 
 async def reminder_loop():
@@ -111,8 +114,8 @@ async def reminder_loop():
             await process_reminders(now)
             await send_digests(now)
             db.cleanup(now)
-        except Exception as error:
+        except Exception:
             # Если что-то пошло не так (например, нет интернета), бот не падает,
-            # а просто пишет ошибку в терминал и пробует снова через 20 секунд
-            print("Ошибка в цикле напоминаний:", error)
+            # а пишет полную ошибку в журнал и пробует снова через 20 секунд
+            log.exception("Ошибка в цикле напоминаний")
         await asyncio.sleep(20)

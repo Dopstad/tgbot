@@ -31,13 +31,14 @@ class StorageTest(BotTestCase):
         self.assertEqual([t[1] for t in db.get_tasks(7)], ["Важное"])
 
     async def test_startup_report(self):
-        import io
-        from contextlib import redirect_stdout
-        out = io.StringIO()
-        with redirect_stdout(out):
+        with self.assertLogs("app.main", level="INFO") as logs:
             main.report_storage(existed_before=True)
-        self.assertIn("найдена существующая", out.getvalue())
-        out = io.StringIO()
-        with redirect_stdout(out):
             main.report_storage(existed_before=False)
-        self.assertIn("создана новая", out.getvalue())
+        joined = "\n".join(logs.output)
+        self.assertIn("найдена существующая", joined)
+        self.assertIn("создана новая", joined)
+
+    async def test_versions_report(self):
+        with self.assertLogs("app.main", level="INFO") as logs:
+            main.report_versions()
+        self.assertIn("aiogram==", logs.output[0])

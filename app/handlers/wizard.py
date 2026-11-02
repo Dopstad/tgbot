@@ -210,6 +210,18 @@ async def wizard_custom_time(message: Message, state: FSMContext):
     await show_wizard(chat_id, state, note=note)
 
 
+@router.message(Wizard.choosing, F.text)
+async def wizard_text_instead_of_button(message: Message, state: FSMContext):
+    """На шаге с кнопками человек написал текст. Не создаём из него задачу, а подсказываем."""
+    chat_id = message.chat.id
+    await delete_quietly(chat_id, message.message_id)
+    data = await state.get_data()
+    if "mode" not in data:
+        await stale_wizard(chat_id, state)
+        return
+    await show_wizard(chat_id, state, note="⚠️ На этом шаге нужно нажать кнопку ниже.")
+
+
 # ---------------------------- кнопки мастера ----------------------------
 
 @router.callback_query(F.data.startswith("w:"))

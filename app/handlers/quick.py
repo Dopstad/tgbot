@@ -1,5 +1,8 @@
-"""Задача обычной фразой: «Позвонить Ивану завтра в 15:00». Этот обработчик подключается последним."""
+"""Задача обычной фразой: «Позвонить Ивану завтра в 15:00». Этот обработчик подключается последним
+и работает только вне мастеров."""
 from aiogram import F, Router
+from aiogram.filters import StateFilter
+from aiogram.fsm.state import default_state
 from aiogram.types import Message
 
 from app import core, db, ui
@@ -8,7 +11,8 @@ from app.parser import parse_task
 router = Router()
 
 
-@router.message(F.text)
+# Только вне мастеров: если человек посреди выбора кнопками написал фразу, задачу не создаём
+@router.message(StateFilter(default_state), F.text)
 async def handle_phrase(message: Message):
     db.ensure_user(message.chat.id)
     result = parse_task(message.text)

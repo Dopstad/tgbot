@@ -165,6 +165,18 @@ class MenuTest(BotTestCase):
         self.assertEqual((task[1], task[4]), ("Позвонить маме", "30"))
         self.assertIn("Записал", self.last_text())
 
+    async def test_typed_phrase_inside_wizard_does_not_create_task(self):
+        """Регрессия: фраза вместо кнопки на шаге мастера раньше создавала лишнюю задачу."""
+        await self.say("/menu")
+        await self.press("➕ Новая задача")
+        await self.say("Тестовая задача")
+        await self.say("Купить хлеб завтра в 18:00")  # вместо кнопки дня
+        self.assertEqual(self.tasks(), [])
+        self.assertIn("нужно нажать кнопку", self.screen_text())
+        self.assertIn("На какой день", self.screen_text())
+        await self.press("Завтра")  # мастер продолжает работать
+        self.assertIn("Выбери час", self.screen_text())
+
     # ---------------- нумерация ----------------
 
     async def test_numbers_have_no_gaps(self):
